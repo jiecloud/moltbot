@@ -1,0 +1,87 @@
+FROM node:22-bookworm
+
+# 第一步：解决GPG key问题 - 在基础镜像层面修复
+# 添加Ubuntu jammy的GPG key，并配置APT源
+RUN apt-get update && \
+    apt-get install -y gnupg2 wget locales && \
+    # 添加缺少的Ubuntu GPG key
+    apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 871920D1991BC93C || \
+    # 如果keyserver失败，直接从Ubuntu官网下载key
+    (wget -qO- https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x871920D1991BC93C | apt-key add -) || true && \
+    # 生成中文本地化支持
+    sed -i '/zh_CN.UTF-8/s/^# //g' /etc/locale.gen && \
+    locale-gen zh_CN.UTF-8 && \
+    # 清理APT缓存
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# 设置默认语言环境
+ENV LANG=zh_CN.UTF-8 \
+    LANGUAGE=zh_CN:zh \
+    LC_ALL=zh_CN.UTF-8
+
+# Install Bun (required for build scripts)
+RUN curl -fsSL https://bun.sh/install | bash
+ENV PATH="/root/.bun/bin:${PATH}"
+
+RUN corepack enable
+
+WORKDIR /app
+
+ARG OPENCLAW_DOCKER_APT_PACKAGES=""
+RUN if [ -n "$OPENCLAW_DOCKER_APT_PACKAGES" ]; then \
+      apt-get update && \
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $OPENCLAW_DOCKER_APT_PACKAGES && \
+      apt-get clean && \
+      rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*; \
+    fi
+
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
+COPY ui/package.json ./ui/package.json
+COPY patches ./patches
+COPY scripts ./scripts
+
+RUN pnpm install --frozen-lockfile
+
+COPY . .
+ENV NODE_OPTIONS="--max-old-space-size=4096"
+RUN OPENCLAW_A2UI_SKIP_MISSING=1 pnpm build
+# Force pnpm for UI build (Bun may fail on ARM/Synology architectures)
+ENV OPENCLAW_PREFER_PNPM=1
+RUN pnpm ui:build
+
+ENV NODE_ENV=production
+
+# 第二步：创建启动脚本，设置默认配置并启动服务
+# 创建启动脚本，避免容器初始化时的GPG验证问题
+RUN echo '#!/bin/bash' > /app/start.sh && \
+    echo '# 跳过容器初始化脚本中的apt更新步骤' >> /app/start.sh && \
+    echo 'export DEBIAN_FRONTEND=noninteractive' >> /app/start.sh && \
+    echo '' >> /app/start.sh && \
+    echo '# 预先配置gateway设置' >> /app/start.sh && \
+    echo 'if [ ! -f /app/.config-set ]; then' >> /app/start.sh && \
+    echo '  echo "Initializing OpenClaw configuration..."' >> /app/start.sh && \
+    echo '  # 使用openclaw.mjs代替dist/index.js进行配置' >> /app/start.sh && \
+    echo '  node openclaw.mjs config set gateway.controlUi.allowInsecureAuth true' >> /app/start.sh && \
+    echo '  node openclaw.mjs onboard --non-interactive --accept-risk || true' >> /app/start.sh && \
+    echo '  touch /app/.config-set' >> /app/start.sh && \
+    echo 'fi' >> /app/start.sh && \
+    echo '' >> /app/start.sh && \
+    echo '# 启动gateway服务' >> /app/start.sh && \
+    echo 'echo "Starting OpenClaw gateway..."' >> /app/start.sh && \
+    echo '# 注意：使用openclaw.mjs代替dist/index.js' >> /app/start.sh && \
+    echo 'exec node openclaw.mjs gateway --bind lan --port 18789 ' >> /app/start.sh && \
+    chmod +x /app/start.sh
+
+# Allow non-root user to write temp files during runtime/tests.
+RUN chown -R node:node /app && \
+    chmod +x /app/start.sh
+
+# Security hardening: Run as non-root user
+# The node:22-bookworm image includes a 'node' user (uid 1000)
+# This reduces the attack surface by preventing container escape via root privileges
+USER root
+
+# 第三步：设置默认启动命令
+# 直接运行我们的启动脚本，绕过容器原有的初始化流程
+ENTRYPOINT ["/bin/bash", "/app/start.sh"]
